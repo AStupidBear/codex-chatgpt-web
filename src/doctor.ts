@@ -13,6 +13,7 @@ import {
   readLauncherBrowserHostDescriptor,
 } from "./launcher-browser-host";
 import { processRunning } from "./process";
+import { inspectRemoteCdp } from "./adapters/chatgpt-web/remote-cdp";
 
 export type CheckStatus = "ok" | "warning" | "error";
 
@@ -108,7 +109,14 @@ export async function runDoctor(): Promise<DoctorReport> {
     return { ok: false, checks };
   }
 
-  if (config.browserHost === "launcher") {
+  if (config.browserHost === "remote-cdp") {
+    try {
+      const status = await inspectRemoteCdp(config.remoteCdpUrl!);
+      checks.push({ id: "browser-host", status: "ok", message: `Remote CDP authenticated (${status.browserVersion})` });
+    } catch (error) {
+      checks.push({ id: "browser-host", status: "error", message: "Remote CDP unavailable", detail: error instanceof Error ? error.message : String(error) });
+    }
+  } else if (config.browserHost === "launcher") {
     try {
       const descriptor = config.browserInteractionMode === "manual"
         ? await inspectLauncherBrowserHostLiveness(config.browserHostDescriptorPath!, { timeoutMs: 5_000 })

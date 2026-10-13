@@ -7,6 +7,7 @@ import { isAbsolute } from "node:path";
 import { stdin, stdout } from "node:process";
 import { captureSystemBrowserLoginToFile, checkBrowserEngine, loginToChatGpt } from "./browser-login";
 import { defaultConfig, getConfigDir, getConfigPath, loadConfig, loadConfigForSetup } from "./config";
+import { inspectRemoteCdp } from "./adapters/chatgpt-web/remote-cdp";
 import {
   inspectLauncherBrowserHost,
   inspectLauncherBrowserHostLiveness,
@@ -68,6 +69,7 @@ Setup options:
   --chrome PATH                Google Chrome/Chromium executable used for account login
   --browser-host-descriptor PATH
                                Use the embedded launcher browser described by this owner-only file
+  --cdp-url URL                Reuse a running remote Chromium profile via CDP
   --refresh-account-capabilities
                                Re-read the authenticated account's available Web models
   --tunnel-id ID               Existing OpenAI tunnel id (full mode)
@@ -303,6 +305,9 @@ async function setupCommand(args: string[]): Promise<void> {
   const runtimeKeyFile = takeOption(args, "--runtime-key-file");
   const chrome = takeOption(args, "--chrome");
   const browserHostDescriptorPath = takeOption(args, "--browser-host-descriptor");
+  const cdpUrl = takeOption(args, "--cdp-url") ?? process.env.CODEX_CHATGPT_WEB_CDP_URL;
+  if (cdpUrl && (browserHostDescriptorPath || chrome)) throw new Error("--cdp-url cannot be combined with --chrome or --browser-host-descriptor");
+  if (cdpUrl) options.remoteCdpUrl = cdpUrl;
   if (chrome) options.chromeExecutablePath = chrome;
   if (browserHostDescriptorPath) options.browserHostDescriptorPath = browserHostDescriptorPath;
   options.refreshAccountCapabilities = takeFlag(args, "--refresh-account-capabilities");
@@ -601,7 +606,10 @@ async function main(): Promise<void> {
     assertNoArgs(args);
     if (action !== "check") throw new Error("Browser command must be: browser check");
     const config = loadConfig();
-    if (config.browserHost === "launcher") {
+    if (config.browserHost === "remote-cdp") {
+      const status = await inspectRemoteCdp(config.remoteCdpUrl!);
+      stdout.write(`Playwright connected to authenticated remote Chromium ${status.browserVersion}.\n`);
+    } else if (config.browserHost === "launcher") {
       if (config.browserInteractionMode === "manual") {
         await inspectLauncherBrowserHostLiveness(config.browserHostDescriptorPath!);
         stdout.write("The launcher browser is reachable; ChatGPT DOM inspection is intentionally disabled in Zero Risk.\n");
@@ -613,6 +621,14 @@ async function main(): Promise<void> {
       await checkBrowserEngine(config);
       stdout.write("Playwright can launch the configured Chrome executable.\n");
     }
+  } else if (command === "cdp") {
+    const action = args.shift() ?? "doctor";
+    assertNoArgs(args);
+    if (action !== "doctor" && action !== "status") throw new Error("CDP command must be doctor or status");
+    const config = loadConfig();
+    if (config.browserHost !== "remote-cdp") throw new Error("Configured browser host is not remote-cdp");
+    const status = await inspectRemoteCdp(config.remoteCdpUrl!, action === "doctor");
+    stdout.write(`${JSON.stringify({ mode: "remote-cdp", ...status }, null, 2)}\n`);
   } else if (command === "serve") {
     assertNoArgs(args);
     const config = loadConfig();

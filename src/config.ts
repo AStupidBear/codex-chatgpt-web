@@ -11,7 +11,7 @@ import type { CodexProviderConfig } from "./types";
 import { VERSION } from "./version";
 
 export type RuntimeMode = "browser-only" | "full";
-export type BrowserHostMode = "managed-chrome" | "launcher";
+export type BrowserHostMode = "managed-chrome" | "launcher" | "remote-cdp";
 export type BrowserInteractionMode = "automatic" | "manual";
 export type SubagentProtocol = "compatibility-v1" | "native";
 
@@ -110,6 +110,7 @@ export interface AppConfig {
   browserHost: BrowserHostMode;
   browserInteractionMode: BrowserInteractionMode;
   browserHostDescriptorPath?: string;
+  remoteCdpUrl?: string;
   chromeExecutablePath: string;
   storageStatePath: string;
   brokerSocketPath: string;
@@ -422,7 +423,7 @@ function parseConfig(value: unknown, path: string): AppConfig {
     throw new Error(`Invalid subagentProtocol in ${path}`);
   }
   if (parsed.host !== "127.0.0.1") throw new Error("The Responses proxy must bind to 127.0.0.1");
-  if (parsed.browserHost !== "managed-chrome" && parsed.browserHost !== "launcher") {
+  if (parsed.browserHost !== "managed-chrome" && parsed.browserHost !== "launcher" && parsed.browserHost !== "remote-cdp") {
     throw new Error(`Invalid browserHost in ${path}`);
   }
   const browserInteractionMode = parsed.browserInteractionMode ?? "automatic";
@@ -472,6 +473,17 @@ function parseConfig(value: unknown, path: string): AppConfig {
   if (parsed.browserHost === "launcher"
     && !isAbsolute(expandUserPath(parsed.browserHostDescriptorPath!))) {
     throw new Error(`Launcher browserHostDescriptorPath must be absolute in ${path}`);
+  }
+  if (parsed.browserHost === "remote-cdp") {
+    if (typeof parsed.remoteCdpUrl !== "string" || !parsed.remoteCdpUrl.trim()) {
+      throw new Error(`Remote CDP browser host requires remoteCdpUrl in ${path}`);
+    }
+    // Validate without opening a network connection or logging URL credentials.
+    const remote = (() => { try { return new URL(parsed.remoteCdpUrl); } catch { return undefined; } })();
+    if (!remote || !["http:", "https:", "ws:", "wss:"].includes(remote.protocol)
+      || !remote.hostname || remote.username || remote.password || remote.hash) {
+      throw new Error(`Invalid remoteCdpUrl in ${path}`);
+    }
   }
   const brokerEndpoint = expandUserPath(parsed.brokerSocketPath!);
   if (process.platform === "win32") {
@@ -635,6 +647,7 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
       browserInteractionMode: config.browserInteractionMode,
       browserHost: config.browserHost,
       browserHostDescriptorPath: config.browserHostDescriptorPath,
+      remoteCdpUrl: config.remoteCdpUrl,
       storageStatePath: config.storageStatePath,
       chromeExecutablePath: config.chromeExecutablePath,
       brokerSocketPath: config.brokerSocketPath,
