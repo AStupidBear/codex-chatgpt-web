@@ -25,6 +25,7 @@ import {
   readCodexSubagentProtocol,
 } from "./codex-integration";
 import { inspectLauncherBrowserHost } from "./launcher-browser-host";
+import { inspectRemoteCdp, validateRemoteCdpUrl } from "./adapters/chatgpt-web/remote-cdp";
 import {
   DEV_CONFIG_PURPOSE,
   DEV_LAUNCHER_PROFILE,
@@ -50,6 +51,7 @@ export interface SetupOptions {
   port?: number;
   chromeExecutablePath?: string;
   browserHostDescriptorPath?: string;
+  remoteCdpUrl?: string;
   refreshAccountCapabilities?: boolean;
   forceLogin?: boolean;
   autoApproveToolCalls?: boolean;
@@ -142,6 +144,7 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     browserHost: before.browserHost,
     browserInteractionMode: before.browserInteractionMode,
     browserHostDescriptorPath: before.browserHostDescriptorPath,
+    remoteCdpUrl: before.remoteCdpUrl,
     chromeExecutablePath: before.chromeExecutablePath,
     storageStatePath: before.storageStatePath,
     brokerSocketPath: before.brokerSocketPath,
@@ -174,6 +177,7 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     browserHost: after.browserHost,
     browserInteractionMode: after.browserInteractionMode,
     browserHostDescriptorPath: after.browserHostDescriptorPath,
+    remoteCdpUrl: after.remoteCdpUrl,
     chromeExecutablePath: after.chromeExecutablePath,
     storageStatePath: after.storageStatePath,
     brokerSocketPath: after.brokerSocketPath,
@@ -294,9 +298,15 @@ function baseConfig(
     config.browserHost = "launcher";
     config.browserHostDescriptorPath = options.browserHostDescriptorPath;
     config.brokerSocketPath = defaultBrokerEndpoint();
+    delete config.remoteCdpUrl;
+  } else if (options.remoteCdpUrl) {
+    config.browserHost = "remote-cdp";
+    config.remoteCdpUrl = validateRemoteCdpUrl(options.remoteCdpUrl);
+    delete config.browserHostDescriptorPath;
   } else if (options.chromeExecutablePath) {
     config.browserHost = "managed-chrome";
     delete config.browserHostDescriptorPath;
+    delete config.remoteCdpUrl;
   }
   if (options.autoApproveToolCalls !== undefined) config.autoApproveToolCalls = options.autoApproveToolCalls;
   if (options.composerPredictionsEnabled !== undefined) {
@@ -479,7 +489,7 @@ function prepareSetup(options: SetupOptions): PreparedSetup {
   });
   delete config.purpose;
   const launcherOwned = config.browserHost === "launcher";
-  if (!launcherOwned && process.platform !== "darwin") {
+  if (!launcherOwned && config.browserHost !== "remote-cdp" && process.platform !== "darwin") {
     throw new Error(
       "Terminal-only managed Chrome setup currently requires macOS. "
       + "Use the Codex Web GPT launcher on Windows or Linux.",
@@ -556,6 +566,12 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
   if (config.browserInteractionMode === "manual") {
     // The generic manual route is independent of account capabilities. The launcher may open the
     // authenticated surface, but setup must not inspect its model selector or infer availability.
+  } else if (config.browserHost === "remote-cdp") {
+    if (options.forceLogin) throw new Error("Remote CDP uses the existing browser profile; --login is not supported");
+    const inspected = await inspectRemoteCdp(config.remoteCdpUrl!, true);
+    solAvailable = inspected.solAvailable;
+    extraHighAvailable = inspected.extraHighAvailable;
+    proAvailable = inspected.proAvailable;
   } else if (config.browserHost === "launcher") {
     if (options.forceLogin) throw new Error("Launcher browser login is owned by the launcher UI; --login cannot replace it");
     const capabilities = await inspectLauncherCapabilities(

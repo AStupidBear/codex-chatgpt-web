@@ -89,6 +89,7 @@ import {
   type ChatGptWebModelFamily,
 } from "../../chatgpt-web-models";
 import { LauncherBrowserHelperClient } from "./launcher-helper-client";
+import { connectRemoteCdp, validateRemoteCdpUrl } from "./remote-cdp";
 import { assertChatGptModelFamily, selectChatGptModelFamily } from "./model-selection";
 import { MAX_CHATGPT_BROWSER_TABS } from "./concurrency";
 import {
@@ -1449,8 +1450,9 @@ interface ChatGptSubmissionDomCache {
 
 export interface ResolvedBrowserConfig {
   appName: string;
-  browserHost: "managed-chrome" | "launcher";
+  browserHost: "managed-chrome" | "launcher" | "remote-cdp";
   browserHostDescriptorPath?: string;
+  remoteCdpUrl?: string;
   browserHelperScriptPath?: string;
   browserDiagnosticsPath?: string;
   storageStatePath: string;
@@ -2179,6 +2181,11 @@ export function resolveBrowserConfig(provider: CodexProviderConfig): ResolvedBro
   const appName = configured.appName?.trim() || CHATGPT_CONNECTOR_NAME;
   const browserHost = configured.browserHost ?? "managed-chrome";
   const browserHostDescriptorPath = configured.browserHostDescriptorPath?.trim();
+  const remoteCdpUrl = configured.remoteCdpUrl?.trim();
+  if (browserHost === "remote-cdp" && !remoteCdpUrl) {
+    throw new Error("Remote CDP browser host requires chatgptWeb.remoteCdpUrl");
+  }
+  if (browserHost === "remote-cdp") validateRemoteCdpUrl(remoteCdpUrl!);
   const browserHelperScriptPath = configured.browserHelperScriptPath?.trim();
   const browserDiagnosticsPath = resolve(expandUserPath(
     configured.browserDiagnosticsPath?.trim() || join(getConfigDir(), "diagnostics", "browser-turns"),
@@ -2206,6 +2213,7 @@ export function resolveBrowserConfig(provider: CodexProviderConfig): ResolvedBro
   return {
     appName,
     browserHost,
+    ...(remoteCdpUrl ? { remoteCdpUrl } : {}),
     ...(browserHostDescriptorPath ? { browserHostDescriptorPath: resolve(expandUserPath(browserHostDescriptorPath)) } : {}),
     ...(resolvedBrowserHelperScriptPath ? { browserHelperScriptPath: resolvedBrowserHelperScriptPath } : {}),
     browserDiagnosticsPath,
@@ -2326,6 +2334,9 @@ export class ChatGptBrowserWorker {
   private launcherHelper?: LauncherBrowserHelperClient;
   private maintenanceTail: Promise<void> = Promise.resolve();
   private readonly activeRuns = new Map<string, Promise<string>>();
+  /** Only tabs created by this worker are stored here. Never enumerate/adopt arbitrary CloakBrowser tabs. */
+  private readonly remoteConversations = new Map<string, Page>();
+  private readonly remoteActiveKeys = new Set<string>();
 
   private constructor(private readonly config: ResolvedBrowserConfig) {}
 
@@ -2451,6 +2462,11 @@ export class ChatGptBrowserWorker {
     }
     await Promise.allSettled([...this.activeRuns.values()]);
     await this.maintenanceTail;
+    if (this.config.browserHost === "remote-cdp") {
+      const ownedPages = new Set([...this.remoteConversations.values(), this.page].filter((p): p is Page => Boolean(p)));
+      this.remoteConversations.clear();
+      await Promise.allSettled([...ownedPages].map(p => p.isClosed() ? Promise.resolve() : p.close()));
+    }
     const browser = this.browser;
     this.browser = undefined;
     this.context = undefined;
@@ -2519,6 +2535,11 @@ export class ChatGptBrowserWorker {
 
   private async ensurePage(): Promise<Page> {
     if (this.page && !this.page.isClosed()) return this.page;
+    if (this.config.browserHost === "remote-cdp") {
+      const { context } = await this.ensureManagedBrowser();
+      this.page = await context.newPage();
+      return this.page;
+    }
     if (this.config.browserHost === "launcher") {
       const connection = await connectLauncherBrowserHost(this.config.browserHostDescriptorPath!);
       this.browser = connection.browser;
@@ -2544,6 +2565,12 @@ export class ChatGptBrowserWorker {
   private async ensureManagedBrowser(): Promise<{ browser: Browser; context: BrowserContext }> {
     if (this.managedBrowserReady) return this.managedBrowserReady;
     const opening = (async () => {
+      if (this.config.browserHost === "remote-cdp") {
+        const connection = await connectRemoteCdp(this.config.remoteCdpUrl!);
+        this.browser = connection.browser;
+        this.context = connection.context;
+        return connection;
+      }
       if (!existsSync(this.config.storageStatePath) || !existsSync(loginVerificationMarkerPath(this.config.storageStatePath))) {
         throw new Error(`ChatGPT web login state is missing: ${this.config.storageStatePath}`);
       }
@@ -4899,8 +4926,43 @@ export class ChatGptBrowserWorker {
     return redactChatGptUiDiagnostic(JSON.stringify({ response: responseState, overlays }));
   }
 
+  private async runRemoteTurn(turn: BrowserTurn): Promise<string> {
+    const key = turn.conversationKey;
+    if (key && this.remoteActiveKeys.has(key)) {
+      throw new Error("Remote CDP conversation is already executing another turn");
+    }
+    // The default context is the real CloakBrowser profile. Never create a new context.
+    const { context } = await this.ensureManagedBrowser();
+    let page = key ? this.remoteConversations.get(key) : undefined;
+    if (page?.isClosed()) {
+      if (key) this.remoteConversations.delete(key);
+      page = undefined;
+    }
+    const reused = page !== undefined;
+    if (turn.requireRetainedConversation && !reused) throw chatGptRetainedConversationUnavailableError();
+    if (reused && !turn.prepareResume) throw new Error("Remote CDP conversation has no continuation prompt");
+    if (!page) page = await context.newPage();
+    if (key) this.remoteActiveKeys.add(key);
+    let succeeded = false;
+    try {
+      await turn.onPreparedSelected?.(reused);
+      const answer = await this.runBrowserTurn(turn, undefined, page, reused);
+      succeeded = true;
+      return answer;
+    } finally {
+      if (key) this.remoteActiveKeys.delete(key);
+      if (succeeded && turn.retainConversation && key && !page.isClosed()) {
+        this.remoteConversations.set(key, page);
+      } else {
+        if (key && this.remoteConversations.get(key) === page) this.remoteConversations.delete(key);
+        if (!page.isClosed()) await page.close().catch(() => {});
+      }
+    }
+  }
+
   private async runExclusive(turn: BrowserTurn): Promise<string> {
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
+    if (this.config.browserHost === "remote-cdp") return this.runRemoteTurn(turn);
     if (this.config.browserHost !== "launcher") return this.runBrowserTurn(turn);
 
     const lease = await notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
